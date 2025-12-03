@@ -1,98 +1,158 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+# cbir_api/main.py
+from pathlib import Path
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
-from PIL import Image
-import io
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session
 
-from models import ImageResult
+from .database import get_db, init_db
+from .models import GalleryImage
+from .features import extract_embedding
+from .faiss_index import add_embedding, search_similar
 
-app = FastAPI(
-    title="CBIR Microservice",
-    description="API de recherche d'images par contenu (CBIR)",
-    version="0.1.0",
-)
 
-# CORS (à adapter si tu as un vrai frontend plus tard)
+app = FastAPI()
+
+# Dossiers uploads
+BASE_UPLOAD_DIR = Path("uploads")
+GALLERY_DIR = BASE_UPLOAD_DIR / "gallery"
+QUERY_DIR = BASE_UPLOAD_DIR / "query"
+
+GALLERY_DIR.mkdir(parents=True, exist_ok=True)
+QUERY_DIR.mkdir(parents=True, exist_ok=True)
+
+# Expose /media pour servir les images
+app.mount("/media", StaticFiles(directory=str(BASE_UPLOAD_DIR)), name="media")
+
+# CORS : Django sur 8000, FastAPI sur 8001
+origins = [
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tu pourras restreindre à ton domaine ensuite
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/health")
-async def health_check():
-    """
-    Simple endpoint pour vérifier que l'API tourne.
-    """
-    return {"status": "ok", "service": "cbir_api"}
+def get_current_user_id():
+    # TODO: brancher avec ta vraie auth Django plus tard
+    return 1
 
 
-@app.post("/search/text", response_model=List[ImageResult])
-async def search_by_text(query: str, limit: int = 5):
-    """
-    Recherche fake par texte.
-    Plus tard: transformer 'query' en embedding, chercher dans FAISS/pgvector.
-    """
-    # Pour l'instant, on renvoie des données factices
-    results = [
-        ImageResult(
-            id=i,
-            score=1.0 - i * 0.1,
-            image_url=f"https://example.com/images/{i}.jpg",
-            thumbnail_url=f"https://example.com/thumbnails/{i}.jpg",
-            metadata={"query": query, "dummy": "true"},
+@app.on_event("startup")
+def on_startup():
+    # création des tables si besoin
+    init_db()
+
+
+@app.get("/")
+def root():
+    return {"message": "CBIR API OK"}
+
+
+@app.post("/gallery/upload")
+async def upload_gallery_image(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    description: str = Form(""),
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    # 1) Vérifier limite 5 images
+    count = db.query(GalleryImage).filter_by(user_id=user_id).count()
+    if count >= 5:
+        raise HTTPException(
+            status_code=400,
+            detail="Tu as déjà 5 images dans ta galerie."
         )
-        for i in range(limit)
-    ]
-    return results
 
+    # 2) Sauvegarder l'image
+    ext = file.filename.split(".")[-1]
+    filename = f"user_{user_id}_{count + 1}.{ext}"
+    filepath = GALLERY_DIR / filename
+    with open(filepath, "wb") as f:
+        f.write(await file.read())
 
-@app.post("/search/image", response_model=List[ImageResult])
-async def search_by_image(file: UploadFile = File(...), limit: int = 5):
-    """
-    Recherche fake par image.
-    Plus tard: extraire embedding de l'image, interroger index vectoriel.
-    """
-    # Vérif simple du type MIME
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Le fichier doit être une image.")
-
-    # Lecture de l'image (on ne fait rien avec pour l'instant, juste un check)
-    content = await file.read()
-    try:
-        image = Image.open(io.BytesIO(content))
-        width, height = image.size
-    except Exception:
-        raise HTTPException(status_code=400, detail="Impossible de lire l'image envoyée.")
-
-    # Résultat factice
-    results = [
-        ImageResult(
-            id=i,
-            score=1.0 - i * 0.1,
-            image_url=f"https://example.com/images/{i}.jpg",
-            thumbnail_url=f"https://example.com/thumbnails/{i}.jpg",
-            metadata={
-                "info": "demo result",
-                "input_width": str(width),
-                "input_height": str(height),
-            },
-        )
-        for i in range(limit)
-    ]
-    return results
-
-
-# Permet de lancer directement: python main.py
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host="127.0.0.1",
-        port=8001,   # Django est déjà sur 8000
-        reload=True,
+    # 3) Créer la ligne en DB (sans embedding)
+    img_db = GalleryImage(
+        user_id=user_id,
+        name=name,
+        description=description,
+        image_path=str(filepath)  # ex: "uploads/gallery/user_1_1.jpg"
     )
+    db.add(img_db)
+    db.commit()
+    db.refresh(img_db)
+
+    # 4) Extraire embedding et l’ajouter dans FAISS
+    embedding = extract_embedding(str(filepath))
+    add_embedding(img_db.id, embedding)
+
+    # 5) Retourner les infos pour le frontend
+    return {
+        "id": img_db.id,
+        "name": img_db.name,
+        "description": img_db.description,
+        # URL pour afficher dans Django : http://127.0.0.1:8001/media/gallery/xxx.jpg
+        "image_url": f"/media/gallery/{filename}",
+    }
+
+
+@app.post("/gallery/search")
+async def search_gallery(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Utilise la nouvelle image comme requête,
+    cherche les images les plus similaires dans la galerie de CE user.
+    """
+    # 1) Sauvegarder l'image de requête
+    ext = file.filename.split(".")[-1]
+    query_filename = f"user_{user_id}_query.{ext}"
+    query_path = QUERY_DIR / query_filename
+    with open(query_path, "wb") as f:
+        f.write(await file.read())
+
+    # 2) Extraire l'embedding de la requête
+    query_embedding = extract_embedding(str(query_path))
+
+    # 3) Recherche FAISS globale (on prend plus large, on filtrera après)
+    distances, ids = search_similar(query_embedding, k=20)
+
+    # 4) Filtrer sur les images appartenant à cet utilisateur
+    results = []
+    for dist, img_id in zip(distances, ids):
+        if img_id == -1:
+            continue
+
+        img = db.query(GalleryImage).filter_by(id=int(img_id), user_id=user_id).first()
+        if not img:
+            continue
+
+        # On reconstruit l'URL publique pour l'image
+        filename = Path(img.image_path).name  # "user_1_1.jpg"
+        image_url = f"/media/gallery/{filename}"
+
+        results.append({
+            "image_id": img.id,
+            "name": img.name,
+            "description": img.description,
+            "image_path": image_url,
+            "distance": float(dist),
+        })
+
+    # 5) Trier par distance croissante (plus proche d'abord)
+    results.sort(key=lambda x: x["distance"])
+
+    return {
+        "query_image": f"/media/query/{query_filename}",
+        "results": results,
+    }

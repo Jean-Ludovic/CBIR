@@ -1,4 +1,9 @@
 fastapi
 uvicorn[standard]
-pillow
+python-multipart
 numpy
+faiss-cpu
+pillow
+torch
+torchvision
+sqlalchemy
