@@ -1,6 +1,7 @@
 # cbir_api/main.py
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -9,7 +10,7 @@ from sqlalchemy.orm import Session
 from .database import get_db, init_db
 from .models import GalleryImage
 from .features import extract_embedding
-from .faiss_index import add_embedding, search_similar
+from .faiss_index import add_embedding  # on garde FAISS pour l'index
 
 
 app = FastAPI()
@@ -45,6 +46,31 @@ def get_current_user_id():
     return 1
 
 
+def compute_distances(vec_a: np.ndarray, vec_b: np.ndarray):
+    """
+    Calcule plusieurs distances entre deux vecteurs :
+    euclidienne, Manhattan, Chebyshev, Canberra.
+    """
+    diff = vec_a - vec_b
+    abs_diff = np.abs(diff)
+
+    d_euclid = float(np.linalg.norm(diff))
+    d_manhattan = float(np.sum(abs_diff))
+    d_chebyshev = float(np.max(abs_diff))
+    d_canberra = float(
+        np.sum(
+            abs_diff / (np.abs(vec_a) + np.abs(vec_b) + 1e-8)
+        )
+    )
+
+    return {
+        "euclidean": d_euclid,
+        "manhattan": d_manhattan,
+        "chebyshev": d_chebyshev,
+        "canberra": d_canberra,
+    }
+
+
 @app.on_event("startup")
 def on_startup():
     # création des tables si besoin
@@ -56,6 +82,9 @@ def root():
     return {"message": "CBIR API OK"}
 
 
+# ---------------------------------------------------------------------------
+# 1) Upload dans la galerie
+# ---------------------------------------------------------------------------
 @app.post("/gallery/upload")
 async def upload_gallery_image(
     file: UploadFile = File(...),
@@ -79,18 +108,18 @@ async def upload_gallery_image(
     with open(filepath, "wb") as f:
         f.write(await file.read())
 
-    # 3) Créer la ligne en DB (sans embedding)
+    # 3) Créer la ligne en DB
     img_db = GalleryImage(
         user_id=user_id,
         name=name,
         description=description,
-        image_path=str(filepath)  # ex: "uploads/gallery/user_1_1.jpg"
+        image_path=str(filepath),  # ex: "uploads/gallery/user_1_1.jpg"
     )
     db.add(img_db)
     db.commit()
     db.refresh(img_db)
 
-    # 4) Extraire embedding et l’ajouter dans FAISS
+    # 4) Extraire embedding et l’ajouter dans FAISS (pour la roadmap)
     embedding = extract_embedding(str(filepath))
     add_embedding(img_db.id, embedding)
 
@@ -99,11 +128,46 @@ async def upload_gallery_image(
         "id": img_db.id,
         "name": img_db.name,
         "description": img_db.description,
-        # URL pour afficher dans Django : http://127.0.0.1:8001/media/gallery/xxx.jpg
+        # URL publique : http://127.0.0.1:8001/media/gallery/xxx.jpg
         "image_url": f"/media/gallery/{filename}",
     }
 
 
+# ---------------------------------------------------------------------------
+# 2) Liste de la galerie (vue CRUD + stats)
+# ---------------------------------------------------------------------------
+from pathlib import Path as SysPath  # pour manipuler les noms de fichier
+
+@app.get("/gallery")
+def list_gallery(
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    images = (
+        db.query(GalleryImage)
+        .filter(GalleryImage.user_id == user_id)
+        .order_by(GalleryImage.id.asc())
+        .all()
+    )
+
+    results = []
+    for img in images:
+        filename = SysPath(img.image_path).name  # ex: user_1_1.jpg
+        image_url = f"/media/gallery/{filename}"
+
+        results.append({
+            "id": img.id,
+            "name": img.name,
+            "description": img.description,
+            "image_url": image_url,
+        })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 3) Recherche dans la galerie = distances + ranking Top 1 / Top 2 / ...
+# ---------------------------------------------------------------------------
 @app.post("/gallery/search")
 async def search_gallery(
     file: UploadFile = File(...),
@@ -112,7 +176,8 @@ async def search_gallery(
 ):
     """
     Utilise la nouvelle image comme requête,
-    cherche les images les plus similaires dans la galerie de CE user.
+    calcule plusieurs distances par rapport à TOUTES les images de la galerie
+    de cet utilisateur.
     """
     # 1) Sauvegarder l'image de requête
     ext = file.filename.split(".")[-1]
@@ -121,24 +186,32 @@ async def search_gallery(
     with open(query_path, "wb") as f:
         f.write(await file.read())
 
-    # 2) Extraire l'embedding de la requête
-    query_embedding = extract_embedding(str(query_path))
+    # 2) Embedding de la requête (forcé en np.array float32)
+    query_emb_raw = extract_embedding(str(query_path))
+    query_emb = np.array(query_emb_raw, dtype="float32")
 
-    # 3) Recherche FAISS globale (on prend plus large, on filtrera après)
-    distances, ids = search_similar(query_embedding, k=20)
+    # 3) Récupérer toutes les images de la galerie de cet user
+    images = (
+        db.query(GalleryImage)
+        .filter(GalleryImage.user_id == user_id)
+        .order_by(GalleryImage.id.asc())
+        .all()
+    )
 
-    # 4) Filtrer sur les images appartenant à cet utilisateur
+    if not images:
+        return {
+            "query_image": f"/media/query/{query_filename}",
+            "results": [],
+        }
+
     results = []
-    for dist, img_id in zip(distances, ids):
-        if img_id == -1:
-            continue
+    for img in images:
+        img_emb_raw = extract_embedding(img.image_path)
+        img_emb = np.array(img_emb_raw, dtype="float32")
 
-        img = db.query(GalleryImage).filter_by(id=int(img_id), user_id=user_id).first()
-        if not img:
-            continue
+        distances = compute_distances(query_emb, img_emb)
 
-        # On reconstruit l'URL publique pour l'image
-        filename = Path(img.image_path).name  # "user_1_1.jpg"
+        filename = Path(img.image_path).name
         image_url = f"/media/gallery/{filename}"
 
         results.append({
@@ -146,13 +219,59 @@ async def search_gallery(
             "name": img.name,
             "description": img.description,
             "image_path": image_url,
-            "distance": float(dist),
+            "distances": distances,
         })
 
-    # 5) Trier par distance croissante (plus proche d'abord)
-    results.sort(key=lambda x: x["distance"])
+    # Tri par défaut : distance euclidienne
+    results.sort(key=lambda x: x["distances"]["euclidean"])
 
     return {
         "query_image": f"/media/query/{query_filename}",
         "results": results,
     }
+
+
+# ---------------------------------------------------------------------------
+# 4) Metrics entre toutes les paires d'images (vue "mode expert")
+# ---------------------------------------------------------------------------
+@app.get("/gallery/metrics")
+def gallery_metrics(
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Calcule les distances entre toutes les paires d'images de la galerie
+    de l'utilisateur.
+    """
+    images = (
+        db.query(GalleryImage)
+        .filter(GalleryImage.user_id == user_id)
+        .order_by(GalleryImage.id.asc())
+        .all()
+    )
+
+    if len(images) < 2:
+        return []  # frontend affichera un message
+
+    # Pré-calcul des embeddings pour chaque image
+    embs = []
+    for img in images:
+        emb_raw = extract_embedding(img.image_path)
+        emb = np.array(emb_raw, dtype="float32")
+        embs.append(emb)
+
+    rows = []
+    n = len(images)
+    for i in range(n):
+        for j in range(i + 1, n):
+            dists = compute_distances(embs[i], embs[j])
+            rows.append({
+                "a_name": images[i].name,
+                "b_name": images[j].name,
+                "d_euclid": dists["euclidean"],
+                "d_manhattan": dists["manhattan"],
+                "d_chebyshev": dists["chebyshev"],
+                "d_canberra": dists["canberra"],
+            })
+
+    return rows
