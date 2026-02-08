@@ -1,0 +1,43 @@
+# === PYTHON / DJANGO ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.so
+
+# Virtual environment
+venv/
+env/
+
+# Django stuff
+db.sqlite3
+media/
+staticfiles/
+static/
+
+# Local Django settings (if you ever create one)
+settings_local.py
+
+# Migrations cache (keep migrations, but ignore pycache inside)
+*/migrations/__pycache__/
+
+# === NODE / TAILWIND / FRONTEND ===
+node_modules/
+npm-debug.log
+yarn-error.log
+pnpm-debug.log
+
+# Build outputs
+public/
+dist/
+frontend/pug/**/*.html  # if compiled output is inside pug folder (optional)
+*.map
+
+# === EDITOR ===
+.vscode/
+.idea/
+
+# === OS FILES ===
+.DS_Store
+Thumbs.db
