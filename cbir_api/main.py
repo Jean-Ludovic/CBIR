@@ -149,12 +149,16 @@ def list_gallery(
 
     results = []
     for img in images:
-        filename = SysPath(img.image_path).name
+        # ✅ NORMALISATION (supporte anciens chemins Windows)
+        normalized_path = (img.image_path or "").replace("\\", "/")
+        filename = SysPath(normalized_path).name  # ex: user_1_1.JPG
+        image_url = f"/media/gallery/{filename}"
+
         results.append({
             "id": img.id,
             "name": img.name,
             "description": img.description,
-            "image_url": f"/media/gallery/{filename}",
+            "image_url": image_url,
         })
 
     return results
@@ -203,7 +207,10 @@ async def search_gallery(
 
         distances = compute_distances(query_emb, img_emb)
 
-        filename = Path(img.image_path).name
+        normalized_path = (img.image_path or "").replace("\\", "/")
+        filename = Path(normalized_path).name
+        image_url = f"/media/gallery/{filename}"
+
         results.append({
             "image_id": img.id,
             "name": img.name,
