@@ -154,8 +154,8 @@ async def upload_gallery_image(
 ):
     # Limite
     count = db.query(GalleryImage).filter_by(user_id=user_id).count()
-    if count >= 10:
-        raise HTTPException(status_code=400, detail="Limite de 10 images atteinte.")
+    if count >= 20:
+        raise HTTPException(status_code=400, detail="Limite de 20 images atteinte.")
 
     # Sauvegarde locale
     ext = file.filename.split(".")[-1]
