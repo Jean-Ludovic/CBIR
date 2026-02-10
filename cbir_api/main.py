@@ -29,7 +29,7 @@ QUERY_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(BASE_UPLOAD_DIR)), name="media")
 
 # ------------------------------------------------------------------
-# CORS (safe, même si tout est server-side)
+# CORS (optionnel)
 # ------------------------------------------------------------------
 origins = [
     "http://127.0.0.1:8000",
@@ -45,13 +45,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ------------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------------
 def get_current_user_id():
     # Auth plus tard
     return 1
+
+
+def norm_path(p: str) -> str:
+    """Normalise un chemin stocké (Windows/Linux) en format POSIX."""
+    return (p or "").replace("\\", "/")
+
+
+def filename_from_any_path(p: str) -> str:
+    """Extrait le nom de fichier même si p contient des backslashes Windows."""
+    return Path(norm_path(p)).name
 
 
 def compute_distances(vec_a: np.ndarray, vec_b: np.ndarray):
@@ -103,23 +112,25 @@ async def upload_gallery_image(
 
     ext = file.filename.split(".")[-1]
     filename = f"user_{user_id}_{count + 1}.{ext}"
-    filepath = GALLERY_DIR / filename
+    filepath = (GALLERY_DIR / filename)
 
     with open(filepath, "wb") as f:
         f.write(await file.read())
 
-    # 🔴 FIX CRITIQUE ICI
+    # ✅ Stockage DB normalisé POSIX
+    filepath_posix = filepath.as_posix()
+
     img_db = GalleryImage(
         user_id=user_id,
         name=name,
         description=description,
-        image_path=filepath.as_posix(),  # ✅ NORMALISÉ
+        image_path=filepath_posix,
     )
     db.add(img_db)
     db.commit()
     db.refresh(img_db)
 
-    embedding = extract_embedding(filepath.as_posix())
+    embedding = extract_embedding(filepath_posix)
     add_embedding(img_db.id, embedding)
 
     return {
@@ -133,8 +144,6 @@ async def upload_gallery_image(
 # ------------------------------------------------------------------
 # 2) Liste galerie
 # ------------------------------------------------------------------
-from pathlib import Path as SysPath
-
 @app.get("/gallery")
 def list_gallery(
     db: Session = Depends(get_db),
@@ -149,16 +158,13 @@ def list_gallery(
 
     results = []
     for img in images:
-        # ✅ NORMALISATION (supporte anciens chemins Windows)
-        normalized_path = (img.image_path or "").replace("\\", "/")
-        filename = SysPath(normalized_path).name  # ex: user_1_1.JPG
-        image_url = f"/media/gallery/{filename}"
-
+        # ✅ supporte anciens chemins Windows
+        filename = filename_from_any_path(img.image_path)
         results.append({
             "id": img.id,
             "name": img.name,
             "description": img.description,
-            "image_url": image_url,
+            "image_url": f"/media/gallery/{filename}",
         })
 
     return results
@@ -175,7 +181,7 @@ async def search_gallery(
 ):
     ext = file.filename.split(".")[-1]
     query_filename = f"user_{user_id}_query.{ext}"
-    query_path = QUERY_DIR / query_filename
+    query_path = (QUERY_DIR / query_filename)
 
     with open(query_path, "wb") as f:
         f.write(await file.read())
@@ -200,22 +206,24 @@ async def search_gallery(
 
     results = []
     for img in images:
+        # ✅ normaliser aussi pour lire le fichier
+        img_path_norm = norm_path(img.image_path)
+
         img_emb = np.array(
-            extract_embedding(img.image_path),
+            extract_embedding(img_path_norm),
             dtype="float32",
         )
 
         distances = compute_distances(query_emb, img_emb)
 
-        normalized_path = (img.image_path or "").replace("\\", "/")
-        filename = Path(normalized_path).name
+        filename = filename_from_any_path(img.image_path)
         image_url = f"/media/gallery/{filename}"
 
         results.append({
             "image_id": img.id,
             "name": img.name,
             "description": img.description,
-            "image_path": f"/media/gallery/{filename}",
+            "image_path": image_url,
             "distances": distances,
         })
 
@@ -245,8 +253,9 @@ def gallery_metrics(
     if len(images) < 2:
         return []
 
+    # ✅ embeddings : normalise chemins avant lecture
     embs = [
-        np.array(extract_embedding(img.image_path), dtype="float32")
+        np.array(extract_embedding(norm_path(img.image_path)), dtype="float32")
         for img in images
     ]
 
