@@ -15,9 +15,9 @@ from .faiss_index import add_embedding
 
 app = FastAPI(title="CBIR API")
 
-# ----------------------------
+# ------------------------------------------------------------------
 # Upload folders
-# ----------------------------
+# ------------------------------------------------------------------
 BASE_UPLOAD_DIR = Path("uploads")
 GALLERY_DIR = BASE_UPLOAD_DIR / "gallery"
 QUERY_DIR = BASE_UPLOAD_DIR / "query"
@@ -25,12 +25,12 @@ QUERY_DIR = BASE_UPLOAD_DIR / "query"
 GALLERY_DIR.mkdir(parents=True, exist_ok=True)
 QUERY_DIR.mkdir(parents=True, exist_ok=True)
 
-# Serve images at /media/...
+# Serve images via /media/...
 app.mount("/media", StaticFiles(directory=str(BASE_UPLOAD_DIR)), name="media")
 
-# ----------------------------
-# CORS (optionnel ici, mais ok)
-# ----------------------------
+# ------------------------------------------------------------------
+# CORS (safe, même si tout est server-side)
+# ------------------------------------------------------------------
 origins = [
     "http://127.0.0.1:8000",
     "http://localhost:8000",
@@ -46,8 +46,11 @@ app.add_middleware(
 )
 
 
+# ------------------------------------------------------------------
+# Utils
+# ------------------------------------------------------------------
 def get_current_user_id():
-    # TODO: brancher vraie auth plus tard
+    # Auth plus tard
     return 1
 
 
@@ -55,19 +58,19 @@ def compute_distances(vec_a: np.ndarray, vec_b: np.ndarray):
     diff = vec_a - vec_b
     abs_diff = np.abs(diff)
 
-    d_euclid = float(np.linalg.norm(diff))
-    d_manhattan = float(np.sum(abs_diff))
-    d_chebyshev = float(np.max(abs_diff))
-    d_canberra = float(np.sum(abs_diff / (np.abs(vec_a) + np.abs(vec_b) + 1e-8)))
-
     return {
-        "euclidean": d_euclid,
-        "manhattan": d_manhattan,
-        "chebyshev": d_chebyshev,
-        "canberra": d_canberra,
+        "euclidean": float(np.linalg.norm(diff)),
+        "manhattan": float(np.sum(abs_diff)),
+        "chebyshev": float(np.max(abs_diff)),
+        "canberra": float(
+            np.sum(abs_diff / (np.abs(vec_a) + np.abs(vec_b) + 1e-8))
+        ),
     }
 
 
+# ------------------------------------------------------------------
+# Startup
+# ------------------------------------------------------------------
 @app.on_event("startup")
 def on_startup():
     init_db()
@@ -83,9 +86,9 @@ def root():
     return {"message": "CBIR API OK"}
 
 
-# ---------------------------------------------------------------------------
-# 1) Upload dans la galerie
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 1) Upload image dans la galerie
+# ------------------------------------------------------------------
 @app.post("/gallery/upload")
 async def upload_gallery_image(
     file: UploadFile = File(...),
@@ -96,7 +99,7 @@ async def upload_gallery_image(
 ):
     count = db.query(GalleryImage).filter_by(user_id=user_id).count()
     if count >= 10:
-        raise HTTPException(status_code=400, detail="Tu as déjà 10 images dans ta galerie.")
+        raise HTTPException(status_code=400, detail="Limite de 10 images atteinte.")
 
     ext = file.filename.split(".")[-1]
     filename = f"user_{user_id}_{count + 1}.{ext}"
@@ -105,17 +108,18 @@ async def upload_gallery_image(
     with open(filepath, "wb") as f:
         f.write(await file.read())
 
+    # 🔴 FIX CRITIQUE ICI
     img_db = GalleryImage(
         user_id=user_id,
         name=name,
         description=description,
-        image_path=str(filepath),
+        image_path=filepath.as_posix(),  # ✅ NORMALISÉ
     )
     db.add(img_db)
     db.commit()
     db.refresh(img_db)
 
-    embedding = extract_embedding(str(filepath))
+    embedding = extract_embedding(filepath.as_posix())
     add_embedding(img_db.id, embedding)
 
     return {
@@ -126,9 +130,9 @@ async def upload_gallery_image(
     }
 
 
-# ---------------------------------------------------------------------------
-# 2) Liste de la galerie
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 2) Liste galerie
+# ------------------------------------------------------------------
 from pathlib import Path as SysPath
 
 @app.get("/gallery")
@@ -156,9 +160,9 @@ def list_gallery(
     return results
 
 
-# ---------------------------------------------------------------------------
-# 3) Recherche
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 3) Recherche CBIR
+# ------------------------------------------------------------------
 @app.post("/gallery/search")
 async def search_gallery(
     file: UploadFile = File(...),
@@ -172,8 +176,10 @@ async def search_gallery(
     with open(query_path, "wb") as f:
         f.write(await file.read())
 
-    query_emb_raw = extract_embedding(str(query_path))
-    query_emb = np.array(query_emb_raw, dtype="float32")
+    query_emb = np.array(
+        extract_embedding(query_path.as_posix()),
+        dtype="float32",
+    )
 
     images = (
         db.query(GalleryImage)
@@ -183,23 +189,26 @@ async def search_gallery(
     )
 
     if not images:
-        return {"query_image": f"/media/query/{query_filename}", "results": []}
+        return {
+            "query_image": f"/media/query/{query_filename}",
+            "results": [],
+        }
 
     results = []
     for img in images:
-        img_emb_raw = extract_embedding(img.image_path)
-        img_emb = np.array(img_emb_raw, dtype="float32")
+        img_emb = np.array(
+            extract_embedding(img.image_path),
+            dtype="float32",
+        )
 
         distances = compute_distances(query_emb, img_emb)
 
         filename = Path(img.image_path).name
-        image_url = f"/media/gallery/{filename}"
-
         results.append({
             "image_id": img.id,
             "name": img.name,
             "description": img.description,
-            "image_path": image_url,
+            "image_path": f"/media/gallery/{filename}",
             "distances": distances,
         })
 
@@ -211,9 +220,9 @@ async def search_gallery(
     }
 
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
 # 4) Metrics (mode expert)
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
 @app.get("/gallery/metrics")
 def gallery_metrics(
     db: Session = Depends(get_db),
@@ -229,10 +238,10 @@ def gallery_metrics(
     if len(images) < 2:
         return []
 
-    embs = []
-    for img in images:
-        emb_raw = extract_embedding(img.image_path)
-        embs.append(np.array(emb_raw, dtype="float32"))
+    embs = [
+        np.array(extract_embedding(img.image_path), dtype="float32")
+        for img in images
+    ]
 
     rows = []
     n = len(images)

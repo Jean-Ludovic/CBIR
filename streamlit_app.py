@@ -118,9 +118,7 @@ calculées à partir d’un embedding.
     with col2:
         st.button("🚀 Procéder à la démo", use_container_width=True, on_click=go, args=("demo",))
 
-    st.divider()
-    st.caption("✅ Sur Streamlit Cloud, l’API tourne en interne (localhost) et Streamlit l’appelle côté serveur.")
-
+   
 
 # ----------------------------
 # GALLERY PAGE
