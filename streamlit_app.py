@@ -37,6 +37,20 @@ def start_api():
     return False
 
 
+def is_http_url(s: str) -> bool:
+    return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
+
+
+def resolve_image_url(path_or_url: str) -> str:
+    """
+    - Si URL Cloudinary -> on renvoie tel quel
+    - Si chemin local /media/... -> on préfixe API_URL
+    """
+    if is_http_url(path_or_url):
+        return path_or_url
+    return f"{API_URL}{path_or_url}"
+
+
 def get_image_bytes(image_path: str) -> BytesIO:
     """
     image_path: ex "/media/gallery/user_1_1.jpg"
@@ -45,6 +59,18 @@ def get_image_bytes(image_path: str) -> BytesIO:
     r = requests.get(f"{API_URL}{image_path}", timeout=20)
     r.raise_for_status()
     return BytesIO(r.content)
+
+
+def show_image(path_or_url: str, use_container_width: bool = True):
+    """
+    Affiche correctement une image:
+    - URL (Cloudinary): st.image(url)
+    - Local /media: st.image(bytes)
+    """
+    if is_http_url(path_or_url):
+        st.image(path_or_url, use_container_width=use_container_width)
+    else:
+        st.image(get_image_bytes(path_or_url), use_container_width=use_container_width)
 
 
 # ----------------------------
@@ -119,7 +145,7 @@ calculées à partir d’un embedding.
         st.button("🚀 Procéder à la démo", use_container_width=True, on_click=go, args=("demo",))
 
     st.divider()
-    st.caption("✅  l’appelle côté serveur.")
+    st.caption("✅ Appels API exécutés côté serveur (Streamlit) + support URLs Cloudinary.")
 
 
 # ----------------------------
@@ -147,10 +173,12 @@ elif st.session_state.page == "gallery":
             c = cols[i % 4]
             with c:
                 try:
-                    st.image(get_image_bytes(img["image_url"]), use_container_width=True)
+                    # ✅ img["image_url"] peut être /media/... ou https://...
+                    show_image(img["image_url"], use_container_width=True)
                 except Exception as e:
                     st.warning(f"Image non chargeable: {e}")
-                st.caption(f"**{img['name']}**")
+
+                st.caption(f"**{img.get('name','(sans nom)')}**")
                 if img.get("description"):
                     st.caption(img["description"])
 
@@ -193,8 +221,8 @@ elif st.session_state.page == "demo":
                     st.stop()
 
                 st.success("Recherche terminée.")
-
                 st.divider()
+
                 st.subheader("Résultats (triés par distance euclidienne)")
                 results = res.get("results", [])
 
@@ -205,7 +233,8 @@ elif st.session_state.page == "demo":
                         cols = st.columns([1, 2])
                         with cols[0]:
                             try:
-                                st.image(get_image_bytes(item["image_path"]), use_container_width=True)
+                                # ✅ item["image_path"] peut être /media/... ou https://...
+                                show_image(item["image_path"], use_container_width=True)
                             except Exception as e:
                                 st.warning(f"Image non chargeable: {e}")
                         with cols[1]:
