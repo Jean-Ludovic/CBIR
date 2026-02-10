@@ -201,8 +201,8 @@ def add_gallery_image_by_url(
 ):
     # Limite
     count = db.query(GalleryImage).filter_by(user_id=user_id).count()
-    if count >= 10:
-        raise HTTPException(status_code=400, detail="Limite de 10 images atteinte.")
+    if count >= 20:
+        raise HTTPException(status_code=400, detail="Limite de 20 images atteinte.")
 
     if not is_http_url(payload.url):
         raise HTTPException(status_code=400, detail="URL invalide (http/https requis).")
