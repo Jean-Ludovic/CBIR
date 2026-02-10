@@ -3,9 +3,10 @@ requests
 fastapi
 uvicorn
 python-multipart
+pydantic
+sqlalchemy
 numpy
-faiss-cpu
 pillow
+faiss-cpu
 torch
 torchvision
-sqlalchemy

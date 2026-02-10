@@ -1,10 +1,13 @@
 # cbir_api/main.py
 from pathlib import Path
+import tempfile
 import numpy as np
+import requests
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .database import get_db, init_db
@@ -13,10 +16,10 @@ from .features import extract_embedding
 from .faiss_index import add_embedding
 
 
-app = FastAPI(title="CBIR API")
+app = FastAPI(title="CBIR API (Hybrid: Local + URL)")
 
 # ------------------------------------------------------------------
-# Upload folders
+# Local storage (optionnel si tu utilises surtout Cloudinary)
 # ------------------------------------------------------------------
 BASE_UPLOAD_DIR = Path("uploads")
 GALLERY_DIR = BASE_UPLOAD_DIR / "gallery"
@@ -25,11 +28,11 @@ QUERY_DIR = BASE_UPLOAD_DIR / "query"
 GALLERY_DIR.mkdir(parents=True, exist_ok=True)
 QUERY_DIR.mkdir(parents=True, exist_ok=True)
 
-# Serve images via /media/...
+# Expose /media pour servir les images LOCALES
 app.mount("/media", StaticFiles(directory=str(BASE_UPLOAD_DIR)), name="media")
 
 # ------------------------------------------------------------------
-# CORS (optionnel)
+# CORS (optionnel ici car Streamlit appelle côté serveur, mais safe)
 # ------------------------------------------------------------------
 origins = [
     "http://127.0.0.1:8000",
@@ -49,18 +52,54 @@ app.add_middleware(
 # Utils
 # ------------------------------------------------------------------
 def get_current_user_id():
-    # Auth plus tard
+    # TODO: brancher vraie auth plus tard
     return 1
 
 
+def is_http_url(s: str) -> bool:
+    return isinstance(s, str) and (s.startswith("http://") or s.startswith("https://"))
+
+
 def norm_path(p: str) -> str:
-    """Normalise un chemin stocké (Windows/Linux) en format POSIX."""
+    """Normalise un chemin Windows/Linux en POSIX (évite les \ et les 404)."""
     return (p or "").replace("\\", "/")
 
 
 def filename_from_any_path(p: str) -> str:
     """Extrait le nom de fichier même si p contient des backslashes Windows."""
     return Path(norm_path(p)).name
+
+
+def to_display_url(image_path_or_url: str) -> str:
+    """
+    - Si c'est une URL (Cloudinary), on renvoie direct.
+    - Si c'est un chemin local, on renvoie /media/gallery/<filename>
+    """
+    if is_http_url(image_path_or_url):
+        return image_path_or_url
+
+    filename = filename_from_any_path(image_path_or_url)
+    return f"/media/gallery/{filename}"
+
+
+def embedding_from_source(image_source: str) -> np.ndarray:
+    """
+    image_source:
+      - chemin local (uploads/...)
+      - URL (Cloudinary)
+    Retourne np.array float32.
+    """
+    if is_http_url(image_source):
+        r = requests.get(image_source, timeout=30)
+        r.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=True, suffix=".jpg") as tmp:
+            tmp.write(r.content)
+            tmp.flush()
+            emb = extract_embedding(tmp.name)
+    else:
+        emb = extract_embedding(norm_path(image_source))
+
+    return np.array(emb, dtype="float32")
 
 
 def compute_distances(vec_a: np.ndarray, vec_b: np.ndarray):
@@ -71,9 +110,7 @@ def compute_distances(vec_a: np.ndarray, vec_b: np.ndarray):
         "euclidean": float(np.linalg.norm(diff)),
         "manhattan": float(np.sum(abs_diff)),
         "chebyshev": float(np.max(abs_diff)),
-        "canberra": float(
-            np.sum(abs_diff / (np.abs(vec_a) + np.abs(vec_b) + 1e-8))
-        ),
+        "canberra": float(np.sum(abs_diff / (np.abs(vec_a) + np.abs(vec_b) + 1e-8))),
     }
 
 
@@ -96,7 +133,16 @@ def root():
 
 
 # ------------------------------------------------------------------
-# 1) Upload image dans la galerie
+# Payload: Add by URL
+# ------------------------------------------------------------------
+class AddByUrlIn(BaseModel):
+    url: str
+    name: str
+    description: str = ""
+
+
+# ------------------------------------------------------------------
+# 1) Upload fichier (local)
 # ------------------------------------------------------------------
 @app.post("/gallery/upload")
 async def upload_gallery_image(
@@ -106,18 +152,20 @@ async def upload_gallery_image(
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
+    # Limite
     count = db.query(GalleryImage).filter_by(user_id=user_id).count()
     if count >= 10:
         raise HTTPException(status_code=400, detail="Limite de 10 images atteinte.")
 
+    # Sauvegarde locale
     ext = file.filename.split(".")[-1]
     filename = f"user_{user_id}_{count + 1}.{ext}"
-    filepath = (GALLERY_DIR / filename)
+    filepath = GALLERY_DIR / filename
 
     with open(filepath, "wb") as f:
         f.write(await file.read())
 
-    # ✅ Stockage DB normalisé POSIX
+    # Stockage DB: chemin POSIX (cross-platform)
     filepath_posix = filepath.as_posix()
 
     img_db = GalleryImage(
@@ -130,19 +178,60 @@ async def upload_gallery_image(
     db.commit()
     db.refresh(img_db)
 
-    embedding = extract_embedding(filepath_posix)
-    add_embedding(img_db.id, embedding)
+    # Embedding + index
+    emb = embedding_from_source(filepath_posix)
+    add_embedding(img_db.id, emb)
 
     return {
         "id": img_db.id,
         "name": img_db.name,
         "description": img_db.description,
-        "image_url": f"/media/gallery/{filename}",
+        "image_url": to_display_url(img_db.image_path),  # /media/...
     }
 
 
 # ------------------------------------------------------------------
-# 2) Liste galerie
+# 1B) Ajouter par URL (Cloudinary)
+# ------------------------------------------------------------------
+@app.post("/gallery/add_by_url")
+def add_gallery_image_by_url(
+    payload: AddByUrlIn,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    # Limite
+    count = db.query(GalleryImage).filter_by(user_id=user_id).count()
+    if count >= 10:
+        raise HTTPException(status_code=400, detail="Limite de 10 images atteinte.")
+
+    if not is_http_url(payload.url):
+        raise HTTPException(status_code=400, detail="URL invalide (http/https requis).")
+
+    # Stocker l'URL en DB
+    img_db = GalleryImage(
+        user_id=user_id,
+        name=payload.name,
+        description=payload.description,
+        image_path=payload.url,  # ✅ Cloudinary
+    )
+    db.add(img_db)
+    db.commit()
+    db.refresh(img_db)
+
+    # Embedding + index
+    emb = embedding_from_source(payload.url)
+    add_embedding(img_db.id, emb)
+
+    return {
+        "id": img_db.id,
+        "name": img_db.name,
+        "description": img_db.description,
+        "image_url": payload.url,  # ✅ direct
+    }
+
+
+# ------------------------------------------------------------------
+# 2) Liste galerie (URL ou local)
 # ------------------------------------------------------------------
 @app.get("/gallery")
 def list_gallery(
@@ -158,20 +247,19 @@ def list_gallery(
 
     results = []
     for img in images:
-        # ✅ supporte anciens chemins Windows
-        filename = filename_from_any_path(img.image_path)
         results.append({
             "id": img.id,
             "name": img.name,
             "description": img.description,
-            "image_url": f"/media/gallery/{filename}",
+            "image_url": to_display_url(img.image_path),
+            "source": "url" if is_http_url(img.image_path) else "local",
         })
 
     return results
 
 
 # ------------------------------------------------------------------
-# 3) Recherche CBIR
+# 3) Recherche CBIR (query upload local, comparaison local+url)
 # ------------------------------------------------------------------
 @app.post("/gallery/search")
 async def search_gallery(
@@ -179,18 +267,17 @@ async def search_gallery(
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
+    # Sauvegarder query localement (temp “persistant” dans uploads/query)
     ext = file.filename.split(".")[-1]
     query_filename = f"user_{user_id}_query.{ext}"
-    query_path = (QUERY_DIR / query_filename)
+    query_path = QUERY_DIR / query_filename
 
     with open(query_path, "wb") as f:
         f.write(await file.read())
 
-    query_emb = np.array(
-        extract_embedding(query_path.as_posix()),
-        dtype="float32",
-    )
+    query_emb = embedding_from_source(query_path.as_posix())
 
+    # Récupérer galerie
     images = (
         db.query(GalleryImage)
         .filter(GalleryImage.user_id == user_id)
@@ -206,24 +293,15 @@ async def search_gallery(
 
     results = []
     for img in images:
-        # ✅ normaliser aussi pour lire le fichier
-        img_path_norm = norm_path(img.image_path)
-
-        img_emb = np.array(
-            extract_embedding(img_path_norm),
-            dtype="float32",
-        )
-
+        img_emb = embedding_from_source(img.image_path)
         distances = compute_distances(query_emb, img_emb)
-
-        filename = filename_from_any_path(img.image_path)
-        image_url = f"/media/gallery/{filename}"
 
         results.append({
             "image_id": img.id,
             "name": img.name,
             "description": img.description,
-            "image_path": image_url,
+            "image_path": to_display_url(img.image_path),
+            "source": "url" if is_http_url(img.image_path) else "local",
             "distances": distances,
         })
 
@@ -236,7 +314,7 @@ async def search_gallery(
 
 
 # ------------------------------------------------------------------
-# 4) Metrics (mode expert)
+# 4) Metrics (mode expert) (local+url)
 # ------------------------------------------------------------------
 @app.get("/gallery/metrics")
 def gallery_metrics(
@@ -253,11 +331,8 @@ def gallery_metrics(
     if len(images) < 2:
         return []
 
-    # ✅ embeddings : normalise chemins avant lecture
-    embs = [
-        np.array(extract_embedding(norm_path(img.image_path)), dtype="float32")
-        for img in images
-    ]
+    # Pré-calc embeddings
+    embs = [embedding_from_source(img.image_path) for img in images]
 
     rows = []
     n = len(images)
