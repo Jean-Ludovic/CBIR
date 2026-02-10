@@ -95,10 +95,10 @@ async def upload_gallery_image(
 ):
     # 1) Vérifier limite 5 images
     count = db.query(GalleryImage).filter_by(user_id=user_id).count()
-    if count >= 5:
+    if count >= 10:
         raise HTTPException(
             status_code=400,
-            detail="Tu as déjà 5 images dans ta galerie."
+            detail="Tu as déjà 10 images dans ta galerie."
         )
 
     # 2) Sauvegarder l'image
